@@ -108,8 +108,11 @@ impl Reader {
             })
             .collect::<Vec<_>>();
 
+        let is_point = range.as_point().is_some();
+        let l0_count = db_state.core().l0.len();
+        let sr_count = db_state.core().compacted.len();
         let max_parallel =
-            compute_max_parallel(db_state.core().l0.len(), &db_state.core().compacted, 4);
+            compute_max_parallel(l0_count, &db_state.core().compacted, 4);
 
         let (l0_iters, sr_iters) = if let Some(point_key) = range.as_point().cloned() {
             let l0 = self.build_point_l0_iters(
@@ -125,6 +128,14 @@ impl Reader {
                 sst_iter_options,
                 point_lookup_stats,
             )?;
+            tracing::trace!(
+                is_point,
+                l0_count,
+                sr_count,
+                l0_iters = l0.len(),
+                sr_iters = sr.len(),
+                "slatedb.build_iterator_sources point"
+            );
             (l0, sr)
         } else {
             let l0_future =
@@ -132,7 +143,18 @@ impl Reader {
             let sr_future =
                 self.build_range_sr_iters(range, db_state, sst_iter_options, max_parallel);
             let (l0_res, sr_res) = join(l0_future, sr_future).await;
-            (l0_res?, sr_res?)
+            let l0 = l0_res?;
+            let sr = sr_res?;
+            tracing::trace!(
+                is_point,
+                l0_count,
+                sr_count,
+                l0_iters = l0.len(),
+                sr_iters = sr.len(),
+                max_parallel,
+                "slatedb.build_iterator_sources range"
+            );
+            (l0, sr)
         };
 
         Ok(IteratorSources {
@@ -273,6 +295,7 @@ impl Reader {
     ///   provided, the read will not return entries with a sequence number
     ///   greater than this value. The final bound is the minimum of this value
     ///   and the bound derived from `options` (e.g., durability, dirty read).
+    #[tracing::instrument(level = "trace", skip_all, fields(key_len, found))]
     pub(crate) async fn get_key_value_with_options<K: AsRef<[u8]>>(
         &self,
         key: K,
@@ -281,13 +304,15 @@ impl Reader {
         write_batch: Option<WriteBatch>,
         max_seq: Option<u64>,
     ) -> Result<Option<KeyValue>, SlateDBError> {
+        let key_slice = key.as_ref();
+        tracing::Span::current().record("key_len", key_slice.len());
+
         #[cfg(not(dst))]
         let now = get_now_for_read(self.mono_clock.clone(), options.durability_filter).await?;
         #[cfg(dst)]
         // Force the current timestamp for DST operations. See #719 for details.
         let now = options.now;
         let max_seq = self.prepare_max_seq(max_seq, options.durability_filter, options.dirty);
-        let key_slice = key.as_ref();
         let range = BytesRange::from_slice(key_slice..=key_slice);
 
         let sst_iter_options = SstIteratorOptions {
@@ -324,7 +349,7 @@ impl Reader {
         )
         .await?;
 
-        iterator
+        let result = iterator
             .next_entry()
             .await?
             .map(|entry| {
@@ -334,7 +359,10 @@ impl Reader {
                     Ok(KeyValue::from(entry))
                 }
             })
-            .transpose()
+            .transpose();
+
+        tracing::Span::current().record("found", result.as_ref().map_or(false, |v| v.is_some()));
+        result
     }
 
     /// Create an iterator over a key range.

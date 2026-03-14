@@ -948,6 +948,75 @@ impl DbReader {
             .await
     }
 
+    /// Get multiple values from the database in a single operation.
+    ///
+    /// Uses a scan from the minimum to maximum key, filtering for only
+    /// the requested keys. This is more efficient than individual `get()`
+    /// calls when fetching many keys, especially for on-disk data, because:
+    /// - SST index blocks are read once per SST (not once per key)
+    /// - Data blocks are read sequentially and shared across keys
+    /// - Iterator setup cost is amortized
+    ///
+    /// Keys that are not found will have `None` values in the result.
+    ///
+    /// ## Arguments
+    /// - `keys`: slice of keys to look up
+    ///
+    /// ## Returns
+    /// - A `HashMap` mapping each found key to its value
+    pub async fn multi_get(
+        &self,
+        keys: &[Bytes],
+    ) -> Result<std::collections::HashMap<Bytes, Bytes>, crate::Error> {
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        if keys.len() == 1 {
+            let mut result = std::collections::HashMap::with_capacity(1);
+            if let Some(value) = self.get(&keys[0]).await? {
+                result.insert(keys[0].clone(), value);
+            }
+            return Ok(result);
+        }
+
+        let wanted: std::collections::HashSet<Bytes> = keys.iter().cloned().collect();
+        let min_key = keys.iter().min().unwrap();
+        let max_key = keys.iter().max().unwrap();
+
+        let scan_options = ScanOptions {
+            read_ahead_bytes: 256 * 1024, // 256KB read-ahead for sequential scan
+            ..ScanOptions::default()
+        };
+
+        let mut iter = self
+            .scan_with_options(min_key.clone()..=max_key.clone(), &scan_options)
+            .await?;
+
+        let mut results = std::collections::HashMap::with_capacity(keys.len());
+        let mut found = 0usize;
+        let mut scanned = 0usize;
+
+        while let Some(kv) = iter.next().await? {
+            scanned += 1;
+            if wanted.contains(&kv.key) {
+                results.insert(kv.key, kv.value);
+                found += 1;
+                if found == wanted.len() {
+                    break; // found all keys, early exit
+                }
+            }
+        }
+
+        tracing::debug!(
+            keys_requested = keys.len(),
+            keys_found = found,
+            records_scanned = scanned,
+            "slatedb.multi_get complete"
+        );
+
+        Ok(results)
+    }
+
     /// Close the database reader.
     ///
     /// ## Returns

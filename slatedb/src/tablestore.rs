@@ -426,6 +426,7 @@ impl TableStore {
     /// ## Arguments
     /// - `handle`: The handle of the SSTable to read the index from.
     /// - `cache_blocks`: Whether to cache the index blocks after reading them.
+    #[tracing::instrument(level = "debug", skip_all, fields(sst_id = ?handle.id, cache_hit))]
     pub(crate) async fn read_index(
         &self,
         handle: &SsTableHandle,
@@ -438,9 +439,11 @@ impl TableStore {
                 .unwrap_or(None)
                 .and_then(|e| e.sst_index())
             {
+                tracing::Span::current().record("cache_hit", true);
                 return Ok(index);
             }
         }
+        tracing::Span::current().record("cache_hit", false);
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
         let obj = ReadOnlyObject { object_store, path };
@@ -479,6 +482,12 @@ impl TableStore {
     /// and falls back to reading from storage for uncached blocks
     /// using an async fetch for each contiguous range that blocks are not cached.
     /// It can optionally cache newly read blocks.
+    #[tracing::instrument(level = "debug", skip_all, fields(
+        sst_id = ?handle.id,
+        block_count = blocks.end - blocks.start,
+        cache_hits,
+        cache_misses,
+    ))]
     pub(crate) async fn read_blocks_using_index(
         &self,
         handle: &SsTableHandle,
@@ -561,6 +570,12 @@ impl TableStore {
                 blocks_read.insert(block_num - blocks.start, block);
             }
         }
+
+        let total_blocks = blocks.end - blocks.start;
+        let cache_misses = blocks_to_cache.len();
+        let cache_hits = total_blocks - cache_misses;
+        tracing::Span::current().record("cache_hits", cache_hits);
+        tracing::Span::current().record("cache_misses", cache_misses);
 
         // Cache the newly read blocks if caching is enabled
         if let Some(ref cache) = self.cache {
